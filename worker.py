@@ -1,58 +1,46 @@
-"""
-Vast.ai Serverless PyWorker for LVLM inference.
+import os
+from vastai import Worker, WorkerConfig, HandlerConfig, BenchmarkConfig
 
-This worker sits between the Vast.ai serverless router and your FastAPI app,
-forwarding requests to /infer and reporting metrics for autoscaling.
+def calculate_workload(req_body):
+    """
+    Estimates the compute cost of the request for the autoscaler.
+    For a VLM, you could parse the prompt length, but a flat rate is
+    often sufficient to tell the engine that the worker is occupied.
+    """
+    return 100.0
 
-Place this file + requirements.txt in a **public** GitHub repo and set
-PYWORKER_REPO in your Vast.ai template to point to it.
-"""
+def main():
+    # 1. Route Handler: Proxies Vast payload to your FastAPI app
+    infer_handler = HandlerConfig(
+        route="/infer",
+        backend_url="http://127.0.0.1:8080/infer",  # Matches the Uvicorn host/port
+        allow_parallel_requests=True,               # vLLM handles concurrent batching
+        workload_calculator=calculate_workload
+    )
 
-from vastai import Worker, WorkerConfig, HandlerConfig, BenchmarkConfig, LogActionConfig
-import base64
+    # 2. Benchmark Configuration: Allows Vast to score the H200's throughput
+    # Vast runs this once on boot to ensure the instance is healthy.
+    benchmark = BenchmarkConfig(
+        backend_url="http://127.0.0.1:8080/infer",
+        # This dummy payload matches your InferenceRequest Pydantic model
+        payload={
+            "file_b64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=", # 1x1 pixel base64 PNG
+            "mime_type": "image/png",
+            "prompt": "benchmark test",
+            "custom_flag": False,
+            "aggregated_page_context": False
+        },
+        complexity_score=100.0 
+    )
 
-# Tiny 1x1 white JPEG for benchmark/health probes (68 bytes)
-TINY_JPEG_B64 = (
-    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoH"
-    "BwYIDAoMCwsKCwsKDA0QDQsNEBEQDQ4OEhMSFA4SFBkUFBcYFxoeHh7/2wBDAQME"
-    "BAUEBQkFBQkeEA0QHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4e"
-    "Hh4eHh4eHh4eHh7/wAARCAABAAEDASIAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACf"
-    "/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAUAQEAAAAAAAAAAAAAAAAAAAAA/8QAFBEBAAAA"
-    "AAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AKwA//9k="
-)
+    # 3. Initialize and run the PyWorker
+    config = WorkerConfig(
+        handlers=[infer_handler],
+        benchmark=benchmark,
+    )
+    
+    worker = Worker(config)
+    worker.run()
 
-
-worker_config = WorkerConfig(
-    model_server_url="http://127.0.0.1",
-    model_server_port=8080,                         # FastAPI/Uvicorn port
-    model_log_file="/dev/null",                     # Logs go to stdout
-    handlers=[
-        HandlerConfig(
-            route="/infer",                         # Your FastAPI endpoint
-            allow_parallel_requests=True,           # vLLM handles batching
-            max_queue_time=120.0,                   # Max time a request can wait in queue
-            workload_calculator=lambda payload: 100.0,  # Fixed cost per request
-            benchmark_config=BenchmarkConfig(
-                generator=lambda: {
-                    "file_b64": TINY_JPEG_B64,
-                    "mime_type": "image/jpeg",
-                },
-                runs=2,
-                concurrency=1,
-            ),
-        ),
-        HandlerConfig(
-            route="/health",                        # Health check passthrough
-            allow_parallel_requests=True,
-            max_queue_time=10.0,
-            workload_calculator=lambda payload: 1.0,
-        ),
-    ],
-    log_action_config=LogActionConfig(
-        on_load=["Application startup complete.", "Uvicorn running on"],
-        on_error=["Traceback (most recent call last):", "RuntimeError:", "Error initializing"],
-        on_info=["Downloading model from GCS", "Download complete"],
-    ),
-)
-
-Worker(worker_config).run()
+if __name__ == "__main__":
+    main()
